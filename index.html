@@ -56,7 +56,7 @@ let settings={wrongThreshold:1};
 try{const loaded=JSON.parse(localStorage.getItem(settingsKey)||'{}');if(Number.isSafeInteger(loaded.wrongThreshold)&&loaded.wrongThreshold>=0&&loaded.wrongThreshold<=1000)settings.wrongThreshold=loaded.wrongThreshold;}catch{}
 const durable=(function createDurableProgress(){
  const backupKey=key+'-backup-v2',dbName='zcmu-practice-records',release='progress-protection-v1';
- let initialMissing=false,baseline={},db=null,writeQueue=Promise.resolve(),loadedBackup=null,message='',readBlocked=false,failedSave=false;
+ let listedBackups=[],initialMissing=false,baseline={},db=null,writeQueue=Promise.resolve(),loadedBackup=null,message='',readBlocked=false,failedSave=false;
  const clone=x=>JSON.parse(JSON.stringify(x));
  const valid=x=>x&&typeof x==='object'&&!Array.isArray(x);
  const canonical=x=>Array.isArray(x)?x.map(canonical):valid(x)?Object.fromEntries(Object.keys(x).sort().map(k=>[k,canonical(x[k])])):x;
@@ -161,14 +161,14 @@ const durable=(function createDurableProgress(){
   return rows.sort((a,b)=>String(b.savedAt).localeCompare(String(a.savedAt)));
  }
  async function showBackups(){
-  const rows=await listBackups();el('recordBackupChoice').replaceChildren();
+  const rows=await listBackups();listedBackups=rows;el('recordBackupChoice').replaceChildren();
   for(let i=0;i<rows.length;i++)el('recordBackupChoice').add(new Option((rows[i].savedAt||'时间未记录')+' · '+count(rows[i].progress)+' 条记录 · '+({latest:'最近保存',previous:'上一次保存','before-open':'历史完整副本',local:'本机副本'}[rows[i].slot]||'备份'),String(i)));
   el('restoreAutoBackup').disabled=!rows.length;
   el('recordRecoveryMessage').textContent=rows.length?'请选一个备份后恢复。恢复前会导出当前进度，不会清除其他题目记录。':'当前没有自动备份。此保护功能只能保留启用后仍存在的记录，不能凭空找回已被覆盖的数据。';
   return rows;
  }
  async function restore(){
-  const rows=await listBackups(),row=rows[Number(el('recordBackupChoice').value)];
+  const rows=listedBackups.length?listedBackups:await listBackups(),row=rows[Number(el('recordBackupChoice').value)];
   if(!row){el('recordRecoveryMessage').textContent='请先检查可用备份。';return;}
   if(!confirm('恢复 '+(row.savedAt||'所选时间')+' 的本机备份？\n会先导出当前进度，再把备份中对应题目的记录恢复；其他题目保留。'))return;
   el('backup').click();
