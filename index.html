@@ -46,6 +46,7 @@ html{-webkit-text-size-adjust:100%;scroll-padding-bottom:130px}body{overflow-wra
 <div class="row" style="margin-top:12px"><button id="clearAttempts" class="danger">清除所选作答记录</button><button id="clearWrong" class="danger">移除所选错题</button></div>
 <p class="muted">两项操作独立：清除作答记录会重置“已练”和已作答标记，保留错题与收藏；移除错题保留作答次数和收藏。删除前会再次列出范围和数量供确认，建议先导出进度备份。</p><div id="manageStatus" class="notice" role="status"></div></details>
 <section><div class="row spread"><span id="position" class="pill">尚未载入题库</span><button id="star">☆ 收藏</button></div><div id="empty" hidden>当前筛选没有题目。可切换筛选或导入采集程序生成的 questions.json。</div><div id="question"><div id="stem" class="stem"></div><p class="answer-hint">点击选项立即判分并显示答案；查看答案记错，直接下一题不计作答。</p><div id="options"></div><div id="result" role="status" aria-live="polite" hidden></div><div class="row spread answer-toolbar" style="margin-top:24px"><button id="prev">上一题</button><div class="row answer-main"><button id="reveal">查看答案（记错）</button><button id="next">下一题</button></div></div><div class="row record-actions"><button id="clearCurrentAttempt">清除此题作答记录</button><button id="clearCurrentWrong">移除此题错题</button></div></div></section>
+<details class="record-manager" id="recordProtection"><summary>本机记录保护与恢复</summary><p id="recordStorageStatus" role="status"></p><p class="muted" id="recordStorageDetails"></p><p class="muted">网页改版继续使用旧版进度，不会更换保存位置。这里的备份只保存在你的浏览器，不上传到网站；清除浏览器全部网站数据仍可能删除备份，请定期导出。</p><div class="row"><button id="checkAutoBackup">检查本机自动备份</button><select id="recordBackupChoice" aria-label="选择自动备份"></select><button id="restoreAutoBackup" disabled>恢复所选自动备份</button></div><p id="recordRecoveryMessage" role="status"></p></details>
 <footer>本页由个人整理，用于基础综合课程自主复习。原题版权归原权利人所有，答案以课程原文为准；待核对题目不自动判分。<br>每位使用者的作答、错题和收藏仅保存在自己的浏览器，不上传至网站。手机与电脑之间可使用“导出进度 / 恢复进度”转移记录。<button id="backup">导出进度</button> <label class="import">恢复进度<input id="restore" type="file" accept=".json"></label><span id="storage"></span></footer>
 </main><script src="bank.js"></script><script>
 'use strict';
@@ -53,7 +54,181 @@ let bank=Array.isArray(window.QUESTION_BANK)?window.QUESTION_BANK:[],shown=[],or
 const el=id=>document.getElementById(id),key='zcmu-practice-v1',settingsKey='zcmu-practice-settings-v1';
 let settings={wrongThreshold:1};
 try{const loaded=JSON.parse(localStorage.getItem(settingsKey)||'{}');if(Number.isSafeInteger(loaded.wrongThreshold)&&loaded.wrongThreshold>=0&&loaded.wrongThreshold<=1000)settings.wrongThreshold=loaded.wrongThreshold;}catch{}
-try{progress=JSON.parse(localStorage.getItem(key)||'{}');if(!progress||typeof progress!=='object'||Array.isArray(progress))progress={};}catch{}
+const durable=(function createDurableProgress(){
+ const backupKey=key+'-backup-v2',dbName='zcmu-practice-records',release='progress-protection-v1';
+ let initialMissing=false,baseline={},db=null,writeQueue=Promise.resolve(),loadedBackup=null,message='',readBlocked=false,failedSave=false;
+ const clone=x=>JSON.parse(JSON.stringify(x));
+ const valid=x=>x&&typeof x==='object'&&!Array.isArray(x);
+ const canonical=x=>Array.isArray(x)?x.map(canonical):valid(x)?Object.fromEntries(Object.keys(x).sort().map(k=>[k,canonical(x[k])])):x;
+ const encode=x=>JSON.stringify(canonical(x));
+ const count=x=>Object.values(x||{}).filter(r=>r&&(r.attempts>0||r.wrong||r.star)).length;
+ const stamp=r=>Number.isFinite(r?._updatedAt)?r._updatedAt:(Date.parse(r?.lastPracticed||'')||0);
+ function parse(raw){
+  const data=JSON.parse(raw);
+  if(!valid(data))throw Error('进度格式异常');
+  const result=Object.create(null);
+  for(const [id,r] of Object.entries(data))if(valid(r))result[id]=r;
+  return result;
+ }
+ function read(){
+  try{const raw=localStorage.getItem(key);return {ok:true,exists:raw!==null,raw,map:raw===null?{}:parse(raw)};}
+  catch{return {ok:false,exists:true,map:{}};}
+ }
+ function merge(...maps){
+  const result=Object.create(null);
+  for(const map of maps)for(const [id,r] of Object.entries(map||{}))if(valid(r)&&(!result[id]||stamp(r)>=stamp(result[id])))result[id]=clone(r);
+  return result;
+ }
+ function status(){
+  const total=count(progress),matched=bank.filter(q=>{const r=record(q);return r.attempts||r.wrong||r.star;}).length;
+  const warning=readBlocked?'旧进度暂时无法读取，已停止覆盖原存储；请先导出当前进度。':failedSave?'本机保存失败，请立即导出进度备份。':'';
+  el('recordStorageStatus').textContent=warning||message||'本机记录已载入；更新网页不会主动清空旧进度。';
+  el('recordStorageDetails').textContent='历史记录条目 '+total+'，当前题库匹配 '+matched+' 题。保存位置与网页版本无关，旧版进度键保持不变。';
+  if(warning)el('storage').textContent=' '+warning;
+  else if(el('storage').textContent.includes('保存失败')||el('storage').textContent.includes('暂时无法读取'))el('storage').textContent='';
+ }
+ function refresh(){
+  stats();renderQuestionList();updateManagement();status();
+ }
+ function backupLocal(map){
+  const raw=encode(map);
+  if(raw.length>500000)return;
+  try{loadedBackup={savedAt:new Date().toISOString(),release,progress:clone(map)};localStorage.setItem(backupKey,JSON.stringify(loadedBackup));}catch{}
+ }
+ function persist(map,force=false){
+  const current=read();readBlocked=!current.ok;
+  if(!current.ok&&!force){failedSave=true;return false;}
+  try{
+   const raw=encode(map);
+   if(raw!==current.raw)localStorage.setItem(key,raw);
+   failedSave=false;readBlocked=false;backupLocal(map);return true;
+  }catch{failedSave=true;return false;}
+ }
+ function envelope(map){return {savedAt:new Date().toISOString(),release,progress:clone(map)};}
+ function writeDb(map,slot){
+  if(!db)return;
+  const value=envelope(map);
+  writeQueue=writeQueue.catch(()=>{}).then(()=>new Promise(resolve=>{
+   try{
+    const tx=db.transaction('snapshots','readwrite'),store=tx.objectStore('snapshots');
+    if(slot)store.put(value,slot);
+    else{
+     const request=store.get('latest');
+     request.onsuccess=()=>{if(request.result)store.put(request.result,'previous');store.put(value,'latest');};
+    }
+    tx.oncomplete=resolve;tx.onerror=resolve;tx.onabort=resolve;
+   }catch{resolve();}
+  }));
+ }
+ function load(){
+  const current=read();readBlocked=!current.ok;initialMissing=current.ok&&!current.exists;
+  let map=current.ok?current.map:{};
+  try{
+   const saved=JSON.parse(localStorage.getItem(backupKey)||'null');
+   if(valid(saved?.progress))loadedBackup=saved;
+  }catch{}
+  if(current.ok&&!current.exists&&loadedBackup){
+   map=clone(loadedBackup.progress);message='原进度未找到，已载入本机自动备份。';
+   persist(map);
+  }else if(!current.ok&&loadedBackup){map=clone(loadedBackup.progress);message='已载入自动备份，原存储未被覆盖。';}
+  baseline=clone(map);return map;
+ }
+ function sync(){
+  const current=read();readBlocked=!current.ok;
+  if(current.ok){progress=merge(baseline,progress,current.map);baseline=clone(progress);}
+ }
+ function save(){
+  const current=read();const now=Date.now();
+  const local=clone(progress);
+  for(const [id,r]of Object.entries(local))if(encode(r)!==encode(baseline[id]||{}))r._updatedAt=Math.max(now,stamp(baseline[id])+1,stamp(current.map[id])+1);
+  progress=merge(baseline,current.ok?current.map:{},local);
+  if(persist(progress))message='进度已保存；本机自动备份已启用。';
+  baseline=clone(progress);if(!readBlocked)writeDb(progress);status();
+ }
+ function allDb(){
+  return new Promise(resolve=>{
+   if(!db){resolve([]);return;}
+   try{
+    const tx=db.transaction('snapshots','readonly'),store=tx.objectStore('snapshots'),slots=['latest','previous','before-open'],out=[];
+    for(const slot of slots){const req=store.get(slot);req.onsuccess=()=>{if(valid(req.result?.progress))out.push({slot,...req.result});};}
+    tx.oncomplete=()=>resolve(out);tx.onerror=()=>resolve([]);
+   }catch{resolve([]);}
+  });
+ }
+ async function listBackups(){
+  const rows=await allDb();
+  if(loadedBackup)rows.push({slot:'local',...loadedBackup});
+  return rows.sort((a,b)=>String(b.savedAt).localeCompare(String(a.savedAt)));
+ }
+ async function showBackups(){
+  const rows=await listBackups();el('recordBackupChoice').replaceChildren();
+  for(let i=0;i<rows.length;i++)el('recordBackupChoice').add(new Option((rows[i].savedAt||'时间未记录')+' · '+count(rows[i].progress)+' 条记录 · '+({latest:'最近保存',previous:'上一次保存','before-open':'历史完整副本',local:'本机副本'}[rows[i].slot]||'备份'),String(i)));
+  el('restoreAutoBackup').disabled=!rows.length;
+  el('recordRecoveryMessage').textContent=rows.length?'请选一个备份后恢复。恢复前会导出当前进度，不会清除其他题目记录。':'当前没有自动备份。此保护功能只能保留启用后仍存在的记录，不能凭空找回已被覆盖的数据。';
+  return rows;
+ }
+ async function restore(){
+  const rows=await listBackups(),row=rows[Number(el('recordBackupChoice').value)];
+  if(!row){el('recordRecoveryMessage').textContent='请先检查可用备份。';return;}
+  if(!confirm('恢复 '+(row.savedAt||'所选时间')+' 的本机备份？\n会先导出当前进度，再把备份中对应题目的记录恢复；其他题目保留。'))return;
+  el('backup').click();
+  sync();
+  for(const [id,r]of Object.entries(row.progress))progress[id]={...r,_updatedAt:Math.max(Date.now(),stamp(progress[id])+1)};
+  if(readBlocked){
+   try{const raw=localStorage.getItem(key);if(raw)localStorage.setItem(key+'-unreadable-copy',raw);}catch{el('recordRecoveryMessage').textContent='无法保留原存储副本，未覆盖。请先导出浏览器中的旧记录。';return;}
+  }
+  const ok=persist(progress,true);baseline=clone(progress);writeDb(progress);
+  if(ok){filter();message='所选自动备份已恢复。';}refresh();
+  el('recordRecoveryMessage').textContent=ok?'备份已恢复，当前进度已另行导出。':'恢复结果目前只在内存中，请导出保存。';
+ }
+ function init(){
+  el('checkAutoBackup').onclick=()=>showBackups();
+  el('restoreAutoBackup').onclick=()=>restore();
+  status();
+  if(typeof window.addEventListener==='function')window.addEventListener('storage',event=>{
+   if(event.key!==key||!event.newValue)return;
+   try{
+    const incoming=parse(event.newValue),old=event.oldValue?parse(event.oldValue):{};
+    progress=merge(old,progress,incoming);baseline=clone(progress);
+    if(encode(progress)!==encode(incoming))persist(progress);
+    message='已同步同一浏览器其他标签页的记录。';refresh();
+   }catch{message='其他标签页的记录暂时无法读取，已保留本页进度。';status();}
+  });
+  if(typeof indexedDB==='undefined')return;
+  const opening=clone(progress);
+  try{
+   const request=indexedDB.open(dbName,1);
+   request.onupgradeneeded=()=>{if(!request.result.objectStoreNames.contains('snapshots'))request.result.createObjectStore('snapshots');};
+   request.onerror=()=>{message='本机备用存储不可用，建议定期导出进度。';status();};
+   request.onsuccess=async()=>{
+    db=request.result;
+    const rows=await allDb();
+    const current=read();
+    if(current.ok&&(initialMissing||!current.exists)){
+     const maps=rows.sort((a,b)=>String(a.savedAt).localeCompare(String(b.savedAt))).map(x=>x.progress);
+     const restored=merge(progress,...maps);
+     if(encode(restored)!==encode(progress)){
+      progress=restored;baseline=clone(progress);persist(progress);message='已从本机备用存储恢复旧进度。';if(!locked)filter();else refresh();
+     }
+    }else if(current.ok){
+     progress=merge(progress,current.map);
+     if(Object.keys(current.map).length){
+      const history=merge(...rows.sort((a,b)=>String(a.savedAt).localeCompare(String(b.savedAt))).map(row=>row.progress));let added=false;
+      for(const [id,r]of Object.entries(history))if(!Object.prototype.hasOwnProperty.call(progress,id)){progress[id]=clone(r);added=true;}
+      if(added){persist(progress);message='已从本机历史副本补回缺失的旧记录。';if(!locked)filter();else refresh();}
+     }
+     baseline=clone(progress);
+    }
+    const fullest=rows.reduce((best,row)=>count(row.progress)>count(best?.progress)?row:best,null);
+    if(fullest&&count(fullest.progress)>count(opening))writeDb(fullest.progress,'before-open');
+    else if(count(opening))writeDb(opening,'before-open');
+    if(current.ok)writeDb(progress);status();
+   };
+  }catch{message='本机备用存储不可用，建议定期导出进度。';status();}
+ }
+ return {load,sync,save,init,status,showBackups,restore};
+})();
+progress=durable.load();
 const record=q=>progress[q.id]||(q.legacyIds||[]).map(id=>progress[id]).find(Boolean)||{};
 const item=q=>progress[q.id]||(progress[q.id]={...record(q)});
 const SUBJECT_ORDER=['中医基础理论','中医诊断学','中药学','方剂学','正常人体解剖学','生物化学','生理学','病理学','药理学'];
@@ -70,7 +245,7 @@ function facets(){
  for(const kind of kinds){const count=bank.filter(q=>kindOf(q)===kind&&(!chosenSubject||subjectOf(q)===chosenSubject)).length;el('kind').add(new Option(`${/^(A1|A2|B1)$/.test(kind)?kind+'型题':kind} · ${count}题`,kind));}
  el('kind').value=kinds.includes(chosenKind)?chosenKind:'';
 }
-function save(){try{localStorage.setItem(key,JSON.stringify(progress));}catch{el('storage').textContent=' 浏览器未允许保存，请导出进度。';}stats();renderQuestionList();updateManagement();}
+function save(){durable.save();stats();renderQuestionList();updateManagement();}
 function valid(a){return Array.isArray(a)&&a.every(q=>q&&typeof q.id==='string'&&typeof q.stem==='string'&&Array.isArray(q.options)&&q.options.length>=2&&q.options.every(s=>typeof s==='string')&&typeof q.answer==='string'&&(q.answerIndex===null||(Number.isInteger(q.answerIndex)&&q.answerIndex>=0&&q.answerIndex<q.options.length)));}
 function paperList(){const selected=el('paper').value;el('paper').replaceChildren(new Option('全部试卷',''));const papers=[...new Set(bank.map(q=>q.source?.paper||'未分类'))];for(const p of papers)el('paper').add(new Option(p,p));el('paper').value=papers.includes(selected)?selected:'';}
 function stats(){const records=bank.map(record);el('stats').textContent=`已采集 ${bank.length} 题 · 已练 ${records.filter(r=>r.attempts).length} 题 · 错题 ${records.filter(r=>r.wrong).length} 题 · 收藏 ${records.filter(r=>r.star).length} 题`;}
@@ -97,7 +272,7 @@ function reveal(mark){
  let message='',correct=false;
  if(known||viewed){
   correct=mark&&known&&selected===q.answerIndex;
-  const r=item(q),wasWrong=r.wrong===true;
+  durable.sync();const r=item(q),wasWrong=r.wrong===true;
   r.attempts=(r.attempts||0)+1;r.lastSelected=viewed?null:selected;r.lastPracticed=new Date().toISOString();
   if(!correct){
    if(!wasWrong)r.wrongCorrectCount=0;
@@ -128,13 +303,13 @@ function reveal(mark){
   b.ariaDisabled='true';
  });
 }
-el('reveal').onclick=()=>reveal(false);el('next').onclick=()=>{if(pendingFilterUpdate){refreshAfterManagement();return;}if(at<shown.length-1){at++;render();}};el('prev').onclick=()=>{if(pendingFilterUpdate){refreshAfterManagement(Math.max(0,at-1));return;}if(at>0){at--;render();}};el('star').onclick=()=>{const q=shown[at];if(q){item(q).star=!item(q).star;save();el('star').textContent=record(q).star?'★ 已收藏':'☆ 收藏';}};
+el('reveal').onclick=()=>reveal(false);el('next').onclick=()=>{if(pendingFilterUpdate){refreshAfterManagement();return;}if(at<shown.length-1){at++;render();}};el('prev').onclick=()=>{if(pendingFilterUpdate){refreshAfterManagement(Math.max(0,at-1));return;}if(at>0){at--;render();}};el('star').onclick=()=>{const q=shown[at];if(q){durable.sync();item(q).star=!item(q).star;save();el('star').textContent=record(q).star?'★ 已收藏':'☆ 收藏';}};
 for(const id of ['mode','paper'])el(id).onchange=filter;for(const id of ['subject','kind'])el(id).onchange=()=>{facets();filter();};el('search').oninput=filter;
 el('shuffle').onclick=()=>{shown=[...ordered];randomMode=true;for(let i=shown.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[shown[i],shown[j]]=[shown[j],shown[i]];}at=0;render();};
 el('sequential').onclick=()=>{shown=[...ordered];randomMode=false;at=0;render();};
 el('file').onchange=async e=>{try{const data=JSON.parse(await e.target.files[0].text());if(!valid(data))throw Error('题库格式无效');bank=[...new Map(data.map(q=>[q.id,q])).values()];paperList();facets();filter();managementFacets();updateManagement();}catch(err){alert('导入失败：'+err.message);}e.target.value='';};
 el('backup').onclick=()=>{const u=URL.createObjectURL(new Blob([JSON.stringify({format:'zcmu-practice-progress',version:2,progress,settings},null,2)],{type:'application/json'})),a=document.createElement('a');a.href=u;a.download='练习进度.json';a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);};
-el('restore').onchange=async e=>{try{const data=JSON.parse(await e.target.files[0].text());if(!data||typeof data!=='object'||Array.isArray(data))throw Error('进度格式无效');const wrapped=data.format==='zcmu-practice-progress',records=wrapped?data.progress:data;if(!records||typeof records!=='object'||Array.isArray(records))throw Error('进度格式无效');if(wrapped&&data.settings){const n=data.settings.wrongThreshold;if(!Number.isSafeInteger(n)||n<0||n>1000)throw Error('错题移除次数无效');settings.wrongThreshold=n;saveSettings();}const restored=new Map();for(const [id,r]of Object.entries(records)){if(!bank.some(q=>q.id===id||(q.legacyIds||[]).includes(id))||!r||typeof r!=='object')continue;const value={star:r.star===true,wrong:r.wrong===true,attempts:Number.isSafeInteger(r.attempts)&&r.attempts>=0?r.attempts:0};if(Number.isSafeInteger(r.wrongCorrectCount)&&r.wrongCorrectCount>=0)value.wrongCorrectCount=r.wrongCorrectCount;if(Number.isInteger(r.lastSelected)&&r.lastSelected>=0)value.lastSelected=r.lastSelected;if(typeof r.lastPracticed==='string')value.lastPracticed=r.lastPracticed;progress[id]=value;restored.set(id,value);}for(const q of bank){const value=restored.get(q.id)||(q.legacyIds||[]).map(id=>restored.get(id)).find(Boolean);if(value)progress[q.id]={...value};}save();filter();}catch(err){alert('恢复失败：'+err.message);}e.target.value='';};
+el('restore').onchange=async e=>{try{const data=JSON.parse(await e.target.files[0].text());if(!data||typeof data!=='object'||Array.isArray(data))throw Error('进度格式无效');const wrapped=data.format==='zcmu-practice-progress',records=wrapped?data.progress:data;if(!records||typeof records!=='object'||Array.isArray(records))throw Error('进度格式无效');if(wrapped&&data.settings){const n=data.settings.wrongThreshold;if(!Number.isSafeInteger(n)||n<0||n>1000)throw Error('错题移除次数无效');settings.wrongThreshold=n;saveSettings();}durable.sync();const restored=new Map();for(const [id,r]of Object.entries(records)){if(!bank.some(q=>q.id===id||(q.legacyIds||[]).includes(id))||!r||typeof r!=='object')continue;const value={star:r.star===true,wrong:r.wrong===true,attempts:Number.isSafeInteger(r.attempts)&&r.attempts>=0?r.attempts:0};if(Number.isSafeInteger(r.wrongCorrectCount)&&r.wrongCorrectCount>=0)value.wrongCorrectCount=r.wrongCorrectCount;if(Number.isInteger(r.lastSelected)&&r.lastSelected>=0)value.lastSelected=r.lastSelected;if(typeof r.lastPracticed==='string')value.lastPracticed=r.lastPracticed;progress[id]=value;restored.set(id,value);}for(const q of bank){const value=restored.get(q.id)||(q.legacyIds||[]).map(id=>restored.get(id)).find(Boolean);if(value)progress[q.id]={...value};}save();filter();}catch(err){alert('恢复失败：'+err.message);}e.target.value='';};
 
 
 function saveSettings(){try{localStorage.setItem(settingsKey,JSON.stringify(settings));}catch{el('storage').textContent=' 浏览器未允许保存设置，请导出进度。';}el('wrongThreshold').value=String(settings.wrongThreshold);el('wrongSettingStatus').textContent=settings.wrongThreshold?`当前：错题累计答对 ${settings.wrongThreshold} 次后自动移出。`:'当前：错题只手动移除。';}
@@ -143,12 +318,12 @@ function managementFacets(){for(const [id,values,label]of [['manageSubject',[...
 function managementSelection(){const subject=el('manageSubject').value,kind=el('manageKind').value,scope=bank.filter(q=>(!subject||subjectOf(q)===subject)&&(!kind||kindOf(q)===kind)).sort(originalOrder),raw=el('manageNumbers').value.trim();if(!raw)return{scope,targets:scope,numbers:scope.map((_,i)=>i+1)};const chosen=new Set(),parts=raw.replace(/[，、；;]/g,',').split(/[,\s]+/).filter(Boolean);if(!parts.length)throw Error('请输入有效题号。');for(const part of parts){const m=part.match(/^(\d+)(?:[-~～—](\d+))?$/);if(!m)throw Error('题号格式无效，请使用 1,3,8-12。');const a=Number(m[1]),b=m[2]?Number(m[2]):a;if(!Number.isSafeInteger(a)||!Number.isSafeInteger(b)||a<1||b<a||b>scope.length)throw Error(`题号须在 1 至 ${scope.length} 之间，范围从小到大填写。`);for(let n=a;n<=b;n++)chosen.add(n);}const numbers=[...chosen].sort((a,b)=>a-b);return{scope,numbers,targets:numbers.map(n=>scope[n-1])};}
 function updateManagement(){try{const {scope,targets,numbers}=managementSelection(),attempts=targets.filter(q=>record(q).attempts).length,wrong=targets.filter(q=>record(q).wrong).length;el('managePreview').textContent=`${el('manageSubject').value||'全部科目'} · ${el('manageKind').value||'全部题型'}：共 ${scope.length} 题，本次选择 ${targets.length} 题；其中已练 ${attempts} 题、错题 ${wrong} 题。`;el('clearAttempts').disabled=!attempts;el('clearWrong').disabled=!wrong;el('manageQuestions').replaceChildren();targets.slice(0,20).forEach((q,i)=>{const li=document.createElement('li');li.value=numbers[i];li.textContent=`范围内固定题号 ${numbers[i]} · ${subjectOf(q)} · ${kindOf(q)} · ${record(q).attempts?'已练':'未练'}${record(q).wrong?' · 错题':''} · ${q.stem.slice(0,100)}`;el('manageQuestions').append(li);});}catch(err){el('managePreview').textContent=err.message;el('clearAttempts').disabled=true;el('clearWrong').disabled=true;el('manageQuestions').replaceChildren();}}
 function refreshAfterManagement(fallback=at){const current=shown[at]?.id,old=[...shown],random=randomMode;filter();if(random){const allowed=new Set(ordered.map(q=>q.id)),seen=new Set(old.map(q=>q.id));shown=[...old.filter(q=>allowed.has(q.id)),...ordered.filter(q=>!seen.has(q.id))];randomMode=true;}const index=shown.findIndex(q=>q.id===current);at=index>=0?index:Math.max(0,Math.min(fallback,shown.length-1));render();updateManagement();}
-function clearProgress(targets,kind){const ids=new Set(targets.map(q=>q.id)),snapshots=new Map(targets.map(q=>[q.id,{...record(q)}])),touched=new Set(targets.flatMap(q=>[q.id,...(q.legacyIds||[])])),protectedIds=new Set();for(const q of bank){if(!ids.has(q.id)&&[q.id,...(q.legacyIds||[])].some(id=>touched.has(id))){progress[q.id]={...record(q)};protectedIds.add(q.id);}}const fields=kind==='attempts'?['attempts','lastSelected','lastPracticed']:['wrong','wrongCorrectCount'];const clear=r=>{const result={...r};for(const field of fields)delete result[field];return result;};for(const id of touched){if(!protectedIds.has(id)&&progress[id])progress[id]=clear(progress[id]);}for(const q of targets)progress[q.id]=clear(snapshots.get(q.id));save();refreshAfterManagement();}
+function clearProgress(targets,kind){durable.sync();const ids=new Set(targets.map(q=>q.id)),snapshots=new Map(targets.map(q=>[q.id,{...record(q)}])),touched=new Set(targets.flatMap(q=>[q.id,...(q.legacyIds||[])])),protectedIds=new Set();for(const q of bank){if(!ids.has(q.id)&&[q.id,...(q.legacyIds||[])].some(id=>touched.has(id))){progress[q.id]={...record(q)};protectedIds.add(q.id);}}const fields=kind==='attempts'?['attempts','lastSelected','lastPracticed']:['wrong','wrongCorrectCount'];const clear=r=>{const result={...r};for(const field of fields)delete result[field];return result;};for(const id of touched){if(!protectedIds.has(id)&&progress[id])progress[id]=clear(progress[id]);}for(const q of targets)progress[q.id]=clear(snapshots.get(q.id));save();refreshAfterManagement();}
 function confirmClear(targets,kind,description){const count=targets.filter(q=>kind==='attempts'?record(q).attempts:record(q).wrong).length;if(!count){el('manageStatus').textContent='所选题目没有可清理的记录。';return;}const action=kind==='attempts'?'清除作答记录':'移除错题',note=kind==='attempts'?'重置已练次数和作答标记，保留错题与收藏。':'只移出错题，保留作答记录与收藏。';if(!confirm(`${description}\n将为 ${count} 题${action}。\n${note}\n确认继续？`))return;clearProgress(targets,kind);el('manageStatus').textContent=`已为 ${count} 题${action}。`;}
 for(const id of ['manageSubject','manageKind'])el(id).onchange=()=>{el('manageStatus').textContent='';updateManagement();};el('manageNumbers').oninput=()=>{el('manageStatus').textContent='';updateManagement();};el('usePracticeScope').onclick=()=>{el('manageSubject').value=el('subject').value;el('manageKind').value=el('kind').value;el('manageNumbers').value='';updateManagement();};
 for(const [id,kind]of [['clearAttempts','attempts'],['clearWrong','wrong']])el(id).onclick=()=>{try{const {targets}=managementSelection();confirmClear(targets,kind,`${el('manageSubject').value||'全部科目'} · ${el('manageKind').value||'全部题型'}\n范围内固定题号：${el('manageNumbers').value.trim()||'全部'}（与管理面板预览一致）`);}catch(err){el('manageStatus').textContent=err.message;}};
 el('clearCurrentAttempt').onclick=()=>{const q=shown[at];if(q)confirmClear([q],'attempts',`当前题：${subjectOf(q)} · ${kindOf(q)} · 固定题号 ${fixedNumbers.get(q.id)+1}\n${q.stem.slice(0,100)}`);};el('clearCurrentWrong').onclick=()=>{const q=shown[at];if(q)confirmClear([q],'wrong',`当前题：${subjectOf(q)} · ${kindOf(q)} · 固定题号 ${fixedNumbers.get(q.id)+1}\n${q.stem.slice(0,100)}`);};
 
 el('wrongThreshold').value=String(settings.wrongThreshold);el('wrongSettingStatus').textContent=settings.wrongThreshold?`当前：错题累计答对 ${settings.wrongThreshold} 次后自动移出。`:'当前：错题只手动移除。';
-paperList();facets();filter();managementFacets();updateManagement();
+paperList();facets();filter();managementFacets();updateManagement();durable.init();
 </script></html>
